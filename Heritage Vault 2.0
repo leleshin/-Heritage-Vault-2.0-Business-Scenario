@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# Family History Search Automation
+# Purpose: Automate searching, updating, backing up, and integrity checks of family history data.
+# Usage:
+#   sudo ./family_history_search.sh [--all | search | update | backup | check]
+# Notes:
+#   - Logs to /var/log/family_history_search.log and syslog.
+
+set -Eeuo pipefail
+
+# Optional notifications (email/Slack)
+if [[ -f /usr/local/lib/family_notify.sh ]]; then
+  source /usr/local/lib/family_notify.sh
+else
+  notify() { :; }
+fi
+
+# ---------------- Config ------------------
+DATA_DIR="/srv/family_history"             # Directory with family records
+BACKUP_DIR="/var/backups/family_history"   # Backup directory
+BACKUP_RETENTION=7                          # Number of backups to keep
+LOCK_FILE="/var/lock/family_history_search.lock"
+LOG_FILE="/var/log/family_history_search.log"
+SEARCH_QUERY_FILE="/srv/family_history/queries.txt"  # Optional file with search queries
+CHECK_THRESHOLD=5                            # Max allowed malformed or missing records
+# -----------------------------------------
+
+log() {
+  local level="$1"; shift
+  local msg="$*"
+  local ts
+  ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+  echo "[$ts] [$level] $msg" | tee -a "$LOG_FILE" | logger -t family_history_search -p "user.${level,,}" || true
+  notify "$level" "$msg"
+}
+
+require_root() {
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    echo "Please run as root (sudo)." >&2
+    exit 1
+  fi
+}
+
+with_lock() {
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    log WARNING "Another instance is running; exiting."
+    exit 0
+  fi
+}
+
+trap 'rc=$?; log ERROR "Script aborted (exit $rc) at line $LINENO"; exit $rc' ERR
+trap 'log INFO "Script finished."' EXIT
+
+timestamp() { date +'%Y-%m-%d_%H-%M-%S'; }
+
+ensure_dir() {
+  mkdir -p "$1"
+}
+
+search_family_history() {
+  log INFO "Running family history search"
+  if [[ -f "$SEARCH_QUERY_FILE" ]]; then
+    while IFS= read -r query; do
+      log INFO "Searching for: $query"
+      # Simple example: find matching records in JSON or CSV files
+      grep -iRl "$query" "$DATA_DIR" >> "$LOG_FILE" 2>&1 || log INFO "No matches for: $query"
+    done < "$SEARCH_QUERY_FILE"
+  else
+    log WARNING "No search queries file found ($SEARCH_QUERY_FILE)"
+  fi
+  log INFO "Family history search completed"
+}
+
+update_family_data() {
+  log INFO "Updating family history records"
+  if [[ -d "$DATA_DIR" ]]; then
+    cd "$DATA_DIR" || return
+    git pull origin main >>"$LOG_FILE" 2>&1 || log WARNING "No git repository or updates skipped"
+  fi
+  log INFO "Family data update completed"
+}
+
+backup_family_data() {
+  log INFO "Backing up family history data"
+  ensure_dir "$BACKUP_DIR"
+  local ts target
+  ts="$(timestamp)"
+  target="$BACKUP_DIR/$ts"
+  ensure_dir "$target"
+  rsync -aHAX --delete --numeric-ids "$DATA_DIR"/ "$target"/ >>"$LOG_FILE" 2>&1
+
+  # Retention
+  local count
+  count="$(ls -1dt "$BACKUP_DIR"/* | wc -l || echo 0)"
+  if (( count > BACKUP_RETENTION )); then
+    ls -1dt "$BACKUP_DIR"/* | tail -n +$((BACKUP_RETENTION+1)) | xargs -r rm -rf
+    log INFO "Applied retention (kept last $BACKUP_RETENTION backups)"
+  fi
+  log INFO "Backup completed to $target"
+}
+
+check_data_integrity() {
+  log INFO "Checking data integrity of family records"
+  local errors
+  # Example: count malformed JSON files
+  errors=$(find "$DATA_DIR" -type f -name "*.json" -exec jq empty {} \; 2>&1 | wc -l)
+  if (( errors > CHECK_THRESHOLD )); then
+    log WARNING "Detected $errors malformed records (threshold $CHECK_THRESHOLD)"
+  else
+    log INFO "Data integrity check passed"
+  fi
+}
+
+main() {
+  require_root
+  with_lock
+  touch "$LOG_FILE"; chmod 640 "$LOG_FILE"
+
+  case "${1:---all}" in
+    --all) search_family_history; update_family_data; backup_family_data; check_data_integrity ;;
+    search) search_family_history ;;
+    update) update_family_data ;;
+    backup) backup_family_data ;;
+    check) check_data_integrity ;;
+    *) echo "Usage: $0 [--all|search|update|backup|check]"; exit 64 ;;
+  esac
+}
+
+main "$@"
